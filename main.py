@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""本地启动入口：uvicorn main:app"""
 
-app = FastAPI()
+from task_orchestrator.app import create_app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app()
