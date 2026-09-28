@@ -8,12 +8,16 @@
 2. 终态确定、可重试失败有退避、取消及时生效；
 3. 进程异常退出后未完成任务不丢失、不重复执行。
 
+在此之上还提供一层**批量依赖编排**：一次提交多个声明了先后关系的任务
+（如“先清洗 → 再聚合 → 最后导出”），批次整体幂等、非法批次整体拒绝、
+失败/取消沿依赖边确定传播，且不改变单任务的任何既有行为。
+
 ## 快速开始
 
 ```bash
 uv sync
 uv run uvicorn main:app --reload          # 启动服务（默认 tasks.db）
-uv run pytest -q                          # 运行全部测试（20 个用例）
+uv run pytest -q                          # 运行全部测试（41 个用例）
 uv run pytest -q --log-cli-level=INFO     # 含输入与判定依据的详细日志
 ```
 
@@ -28,6 +32,8 @@ uv run pytest -q --log-cli-level=INFO     # 含输入与判定依据的详细日
 | GET | `/tasks/{task_id}` | 按任务 ID 查询状态 |
 | GET | `/tasks/by-key/{idempotency_key}` | 按业务幂等键查询 |
 | POST | `/tasks/{task_id}/cancel` | 请求取消（终态任务幂等返回） |
+| POST | `/batches/submit` | 批量提交带依赖任务（201 新建 / 200 幂等重复） |
+| GET | `/batches/by-key/{batch_key}` | 按批次幂等键查询批次及全部任务 |
 | GET | `/health` | 健康检查 |
 
 提交请求示例：
@@ -59,6 +65,113 @@ uv run pytest -q --log-cli-level=INFO     # 含输入与判定依据的详细日
 可重试错误）、`always_fail`（直接不可重试失败）、`slow`（按 `duration` 秒
 分段睡眠、每 0.02s 响应取消）。
 
+## 批量依赖编排
+
+一次业务提交可以携带多个有先后关系的任务。每个任务仍有自己的**业务唯一键、
+任务类型、参数、优先级、作用域**，并通过 `depends_on`（业务唯一键数组）声明
+依赖；被依赖任务可以在同一批内，也可以是此前已提交过的单任务/历史批次任务。
+
+```json
+POST /batches/submit
+{
+  "idempotency_key": "pipeline-20260929-001",
+  "tasks": [
+    {"idempotency_key": "clean",  "task_type": "echo", "payload": {"step": 1}},
+    {"idempotency_key": "agg",    "task_type": "echo", "payload": {"step": 2},
+     "depends_on": ["clean"], "priority": "high"},
+    {"idempotency_key": "export", "task_type": "echo", "payload": {"step": 3},
+     "depends_on": ["agg"]}
+  ]
+}
+```
+
+响应按提交位置有序返回每个任务的 `task_id / status / depends_on / already_exists`，
+以及批次的 `batch_id` 与批次级 `already_exists`。
+
+### 批次幂等与一致性
+
+- 批次自身有业务幂等键：**同一批次重复提交（含 20 路并发重复提交）只会产生
+  同一组任务与同一套依赖关系，返回的 batch_id / task_id 完全一致**，每个任务
+  仍只执行一次。批次写入是单连接上的单个 `BEGIN IMMEDIATE` 事务
+  （批次行 + 任务行 + 成员关系 + 依赖边），并发下恰好一方插入成功。
+- **批次内容指纹**：按提交位置排列的每个任务的规范化声明
+  （载荷哈希、类型、作用域、优先级、max_attempts、timeout、**排序后的依赖集合**）。
+  即依赖的声明顺序不影响指纹，但任务集合/参数/依赖集合/提交顺序不同则是另一批。
+- 同批次键但内容不同 → `409 batch_conflict`；批次中某业务唯一键已被历史任务
+  占用且任务参数或依赖集合不一致 → `409 payload_conflict`。冲突在任何写入之前
+  判定，**不会只写进去一半任务**。
+
+### 批量提交的拒绝原因（提交时整体拒绝，422 可区分）
+
+| error.code | 含义 |
+| --- | --- |
+| `invalid_batch_key` / `empty_batch` | 批次键为空，或批次不含任务 |
+| `duplicate_task_in_batch` | 批次内同一业务唯一键重复声明 |
+| `unknown_task_type` / `invalid_payload` / `invalid_priority` / `invalid_scope` / `invalid_max_attempts` / `invalid_timeout` | 单任务字段校验（与单任务提交同一套规则） |
+| `invalid_dependency` / `duplicate_dependency` | `depends_on` 不是字符串数组、或同一依赖重复声明 |
+| `cycle_dependency` | 批内存在循环依赖（含任务依赖自身），Kahn 拓扑校验 |
+| `dependency_not_found` | 依赖键在同批与历史任务中均不存在 |
+| `cross_scope_dependency` | 依赖了其他作用域的任务（依赖必须与任务同 scope） |
+
+跨批次循环不可能出现：历史任务的依赖边在其提交时已固定，新批只能追加
+“新任务 → 旧任务”的边，旧任务不可能反向依赖尚未创建的新任务。
+
+### 依赖状态流转
+
+新增两个状态（单任务提交永远不会进入它们）：
+
+- `blocked`：任务已提交但至少一个依赖尚未成功结束，**不会出现在调度候选集中**
+  （`list_runnable` 只取 pending），因此不可能被提前领取执行；
+- `skipped`（**终态**）：依赖未满足且确定不再可能满足，任务从未执行
+  （`attempts` 恒为 0），与处理器真正执行失败的 `failed` 终态明确区分。
+
+```
+ 提交(有依赖)                 所有依赖均 succeeded
+ ┌─────────┐  ─────────────────────────────────────▶ ┌─────────┐
+ │ blocked │                                         │ pending │ →（原单任务状态机）
+ └─────────┘                                         └─────────┘
+     │  任一依赖终态为 failed/cancelled/skipped
+     │  （或等待期间被用户取消）
+     ▼
+ ┌─────────┐
+ │ skipped │  终态（error_code 见下），attempts 恒为 0
+ └─────────┘
+```
+
+### 失败与取消的传播规则
+
+- **全部前置成功**：blocked → pending，`scheduled_at` 置为当前时刻，下一个
+  调度 tick 即可参与派发；随后的优先级/老化/作用域并发规则与普通任务完全一致。
+- **任一前置为 `failed`**：任务立即 `skipped`，`error_code=dependency_failed`。
+- **任一前置为 `cancelled` 或 `skipped`（且不存在失败链）**：任务立即
+  `skipped`，`error_code=dependency_cancelled`。失败原因沿依赖链传递——
+  若某条 skipped 链的源头是执行失败，传递下游仍标记 `dependency_failed`，
+  因此“多个前置一部分成功、一部分失败”时结论与依赖声明顺序无关、稳定一致。
+- 传播是**固定点迭代**：一个任务落终态会在**同一个数据库事务内**级联重算其
+  全部下游（含多层扇入/扇出），不会出现“父已 skipped、孙还 blocked”的中间态。
+- **等待依赖期间被取消**：blocked 上的取消请求立即落 `cancelled` 终态
+  （不挂起、不等 tick），并在同一事务内向其下游传播 `dependency_cancelled`；
+  之后即使前置成功，任务也不会恢复执行。
+- 对一个正在重试（pending 退避中）的依赖，下游继续 blocked 等待；只有依赖
+  重试耗尽进入 failed 才传播 skipped。
+
+### 与幂等、优先级、并发、重启恢复的兼容范围
+
+- **幂等**：批次幂等建立在既有任务幂等键唯一约束之上；批次内任务可与历史任务
+  共享键（此时复用该任务，参数/依赖必须一致），单任务 `/tasks/submit` 的行为、
+  返回与冲突规则保持不变。
+- **优先级与老化**：blocked 任务不参与排序；释放为 pending 后按既有
+  `优先级序数×1000 − 老化值` 规则参与派发，老化自任务 `created_at`（批次提交
+  时刻）起算，因此长时间等待依赖的低优先级任务就绪后不会被持续到达的新任务
+  饿死。
+- **作用域并发**：依赖释放只改变“可否参与派发”，真正执行仍领取同 scope 的
+  semaphore，作用域上限不会因大量后置同时就绪而被突破。
+- **重启恢复**：依赖边与批次关系持久化在 `task_dependencies / batches /
+  batch_tasks` 表中。`recover_on_startup` 在恢复 running 残留的同一事务内做一次
+  全量 blocked 对齐：已成功前置不会重复执行（claim 仍是条件 UPDATE），
+  blocked 后置在依赖未满足前不会提前执行；崩溃期间落定的 failed/cancelled
+  前置会在重启后立即把下游收敛到确定终态，状态与依赖关系不丢不重。
+
 ## 任务状态机
 
 ```
@@ -82,12 +195,15 @@ uv run pytest -q --log-cli-level=INFO     # 含输入与判定依据的详细日
                                 └───────────┘
 ```
 
-- 三个终态：`succeeded / failed / cancelled`，均由**带前置状态条件的 SQL UPDATE**
-  落库（`WHERE status='running' ...`），因此终态不可能被重复转换。
+- 单任务三个终态：`succeeded / failed / cancelled`，均由**带前置状态条件的 SQL
+  UPDATE** 落库（`WHERE status='running' ...`），因此终态不可能被重复转换。
+  批量依赖任务额外使用 `blocked`（等待依赖的非终态）与 `skipped`
+  （依赖失败/取消被传播的终态，未执行），流转规则见上文“依赖状态流转”。
 - **取消与完成竞态**：成功落库要求 `cancel_requested=0`；若处理器完成时取消请求
   已先落库，则成功 UPDATE 命中 0 行，改由 `mark_cancelled_if_running` 落 cancelled。
   两种结果只可能赢一个，不会出现 “succeeded 且 cancel_requested=1” 的矛盾状态。
-- pending 任务的取消直接进入终态（不再被领取）；终态任务上重复取消原样返回。
+- pending / blocked 任务的取消直接进入终态（不再被领取/等待）；终态任务上重复
+  取消原样返回。
 
 ## 重试与超时规则
 
@@ -132,6 +248,11 @@ uv run pytest -q --log-cli-level=INFO     # 含输入与判定依据的详细日
       （崩溃时那一次已计数，体现 **at-least-once**，不会与成功结果重复）；
     - 已请求取消 → 直接 `cancelled`，取消请求不因重启丢失。
   - 退避中的 pending 任务保持原 `scheduled_at` 不变；终态任务原样保留。
+- **依赖的持久化与传播**：`batches`（批次键 + 内容指纹）、`batch_tasks`
+  （批次→任务成员及提交位置）、`task_dependencies`（任务→依赖业务键）三张表与
+  任务在同一事务内写入。成功/失败/取消的终态流转在**同一事务内**执行 blocked
+  下游的固定点传播；`recover_on_startup` 也在恢复事务内对全部 blocked 做一次
+  幂等对齐，保证传播与崩溃不出现中间态。
 - 语义为 at-least-once：崩溃窗口内的处理器可能已产生副作用，业务侧应通过
   幂等键与处理器自身幂等保证最终效果唯一。
 
@@ -139,14 +260,16 @@ uv run pytest -q --log-cli-level=INFO     # 含输入与判定依据的详细日
 
 ```
 app/
-  models.py    # 状态/优先级枚举、TaskRecord、领域异常
-  store.py     # SQLite 持久层：条件 UPDATE 状态机、幂等插入、启动恢复
+  models.py    # 状态/优先级枚举（含 blocked/skipped）、TaskRecord/BatchRecord、领域异常
+  store.py     # SQLite 持久层：条件 UPDATE 状态机、幂等插入、批次原子提交、
+               #   依赖传播固定点、启动恢复（含 blocked 全量对齐）
   handlers.py  # 处理器注册表、取消令牌、4 个内置处理器
-  executor.py  # 调度循环、优先级老化、作用域信号量、重试/超时/取消执行
-  service.py   # 提交校验、规范化哈希、幂等/冲突判定
-  api.py       # FastAPI 路由与错误码映射
+  executor.py  # 调度循环、优先级老化、作用域信号量、重试/超时/取消执行（未因批量改动）
+  service.py   # 单任务提交校验、规范化哈希、幂等/冲突判定
+  batch.py     # 批量依赖编排：批次校验（循环/引用/跨作用域）、内容指纹、原子提交
+  api.py       # FastAPI 路由与错误码映射（/tasks/* 与 /batches/*）
 main.py        # 组装入口：uvicorn main:app
-tests/         # 4 组 20 个用例
+tests/         # 5 组 41 个用例
 ```
 
 ## 本地验证
@@ -155,11 +278,24 @@ tests/         # 4 组 20 个用例
 # 1) 全量测试（每个用例日志打印输入与判定依据）
 uv run pytest -q --log-cli-level=INFO
 
-# 2) 手工联调
+# 2) 只跑批量依赖编排用例
+uv run pytest tests/test_batch.py -q --log-cli-level=INFO
+
+# 3) 手工联调
 uv run uvicorn main:app --port 8000 &
 curl -s -X POST localhost:8000/tasks/submit -H 'Content-Type: application/json' \
   -d '{"idempotency_key":"k1","task_type":"echo","payload":{"value":42}}'
 curl -s localhost:8000/tasks/by-key/k1
+
+# 批量提交一条 clean -> agg -> export 依赖链并查询批次
+curl -s -X POST localhost:8000/batches/submit -H 'Content-Type: application/json' -d '{
+  "idempotency_key": "pipe-1",
+  "tasks": [
+    {"idempotency_key": "clean", "task_type": "echo", "payload": {}},
+    {"idempotency_key": "agg", "task_type": "echo", "payload": {}, "depends_on": ["clean"]},
+    {"idempotency_key": "export", "task_type": "echo", "payload": {}, "depends_on": ["agg"]}
+  ]}'
+curl -s localhost:8000/batches/by-key/pipe-1
 ```
 
 测试覆盖的关键场景：
@@ -171,4 +307,11 @@ curl -s localhost:8000/tasks/by-key/k1
 - `tests/test_lifecycle.py`：退避重试成功、重试耗尽 vs 致命失败错误码可区分、
   终态不重复转换、pending/running 取消、**取消与完成竞态**；
 - `tests/test_recovery.py`：崩溃遗留 running 任务重启后续跑且计数正确、
-  退避中 pending 与终态跨重启语义不变、取消请求跨重启生效。
+  退避中 pending 与终态跨重启语义不变、取消请求跨重启生效；
+- `tests/test_batch.py`（21 个用例）：批次重复/**20 路并发重复提交标识一致**、
+  批次内容冲突与单键冲突、循环依赖（自环/两环/三环）与引用不存在/跨作用域/
+  批次内重复键的整体拒绝且不写一半、链式 gating 严格按序、**多前置部分失败的
+  skipped 终态与 dependency_failed/dependency_cancelled 原因稳定可区分**、
+  等待依赖期间取消立即落定并向下游传播、**依赖释放时作用域并发上限不被突破**、
+  同时就绪任务的优先级生效、**异常重启后已完成前置不重复执行且 blocked 不提前
+  执行**、崩溃后传播对齐、单批次 150 任务 6 层菱形依赖的规模场景。

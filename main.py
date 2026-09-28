@@ -11,14 +11,15 @@ import json
 import os
 
 from app.api import create_app
+from app.batch import BatchService
 from app.executor import Executor
 from app.handlers import HandlerRegistry, register_builtin_handlers
 from app.service import TaskService
 from app.store import TaskStore
 
 
-def build_service(db_path: str | None = None) -> tuple[TaskService, Executor, TaskStore]:
-    """组装默认服务：内置处理器 + SQLite 文件持久化 + 调度执行器。"""
+def build_service(db_path: str | None = None) -> tuple[TaskService, Executor, TaskStore, BatchService]:
+    """组装默认服务：内置处理器 + SQLite 文件持久化 + 调度执行器 + 批量编排。"""
     store = TaskStore(db_path or os.environ.get("TASK_DB_PATH", "tasks.db"))
     store.connect()
     registry = HandlerRegistry()
@@ -30,8 +31,9 @@ def build_service(db_path: str | None = None) -> tuple[TaskService, Executor, Ta
         scope_concurrency=json.loads(os.environ.get("TASK_SCOPE_CONCURRENCY", "{}")),
     )
     service = TaskService(store, registry, executor)
-    return service, executor, store
+    batch_service = BatchService(store, registry)
+    return service, executor, store, batch_service
 
 
-service, executor, _store = build_service()
-app = create_app(service, executor)
+service, executor, _store, batch_service = build_service()
+app = create_app(service, executor, batch_service)

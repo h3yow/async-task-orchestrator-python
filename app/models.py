@@ -16,14 +16,21 @@ class TaskStatus(str, enum.Enum):
     """任务状态机枚举（值即持久化字符串）。"""
 
     PENDING = "pending"        # 已提交，等待调度（可能在退避等待中）
+    BLOCKED = "blocked"        # 已提交，但尚有依赖未成功结束，不可被调度领取
     RUNNING = "running"        # 已被某个工作协程领取执行
     SUCCEEDED = "succeeded"    # 终态：成功
     FAILED = "failed"          # 终态：重试耗尽或不可重试失败
-    CANCELLED = "cancelled"    # 终态：被取消
+    CANCELLED = "cancelled"    # 终态：被取消（含等待依赖期间被取消）
+    SKIPPED = "skipped"        # 终态：依赖失败/取消而被传播跳过，从未执行
 
 
 TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
-    {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+    {
+        TaskStatus.SUCCEEDED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.SKIPPED,
+    }
 )
 
 
@@ -68,6 +75,16 @@ class TaskRecord:
     cancel_requested: bool = False
 
 
+@dataclass
+class BatchRecord:
+    """batches 表的一行：记录一次批量提交的幂等键与其规范化内容指纹。"""
+
+    id: str
+    idempotency_key: str
+    content_hash: str
+    created_at: datetime = field(default_factory=utcnow)
+
+
 class OrchestratorError(Exception):
     """服务层异常基类。"""
 
@@ -80,5 +97,13 @@ class PayloadConflict(OrchestratorError):
     """幂等键相同但载荷不一致（HTTP 409 语义）。"""
 
 
+class BatchConflict(OrchestratorError):
+    """批次幂等键相同但批次内容不一致（HTTP 409 语义）。"""
+
+
 class TaskNotFound(OrchestratorError):
     """任务不存在（HTTP 404 语义）。"""
+
+
+class BatchNotFound(OrchestratorError):
+    """批次不存在（HTTP 404 语义）。"""

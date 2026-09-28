@@ -13,6 +13,7 @@ import httpx
 import pytest_asyncio
 
 from app.api import create_app
+from app.batch import BatchService
 from app.executor import Executor
 from app.handlers import HandlerRegistry, register_builtin_handlers
 from app.service import TaskService
@@ -48,7 +49,10 @@ def _make_stack(
         tick_interval=tick_interval,
     )
     service = TaskService(store, registry, executor)
-    fastapi_app = create_app(service, executor)
+    batch_service = BatchService(store, registry)
+    fastapi_app = create_app(service, executor, batch_service)
+    # 保持 5 元组返回签名以兼容既有用例；批量服务挂在 app.state 上供新用例取用
+    fastapi_app.state.batch_service = batch_service
     return store, registry, executor, service, fastapi_app
 
 
@@ -56,6 +60,7 @@ def _make_stack(
 async def env(tmp_path) -> AsyncIterator[dict]:
     """启动执行器并提供 ASGI 客户端；用例结束自动停止。"""
     store, registry, executor, service, fastapi_app = _make_stack(tmp_path)
+    batch_service = fastapi_app.state.batch_service
     await executor.start()
     transport = httpx.ASGITransport(app=fastapi_app)
     async with httpx.AsyncClient(
@@ -66,6 +71,7 @@ async def env(tmp_path) -> AsyncIterator[dict]:
             "registry": registry,
             "executor": executor,
             "service": service,
+            "batch_service": batch_service,
             "client": client,
             "db_path": str(tmp_path / "tasks.db"),
         }
