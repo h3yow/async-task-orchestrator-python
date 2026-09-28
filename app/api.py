@@ -20,6 +20,8 @@ from pydantic.config import ConfigDict
 
 from .executor import Executor
 from .models import (
+    BatchConflict,
+    BatchNotFound,
     OrchestratorError,
     PayloadConflict,
     TaskNotFound,
@@ -39,6 +41,26 @@ class SubmitRequest(BaseModel):
     scope: str = Field(default="default", min_length=1, max_length=64)
     max_attempts: int = Field(default=3, ge=1, le=20)
     timeout_seconds: float = Field(default=10.0, gt=0, le=3600.0)
+
+
+class BatchTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    task_type: str = Field(min_length=1, max_length=64)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    priority: Literal["high", "normal", "low"] = "normal"
+    scope: str = Field(default="default", min_length=1, max_length=64)
+    max_attempts: int = Field(default=3, ge=1, le=20)
+    timeout_seconds: float = Field(default=10.0, gt=0, le=3600.0)
+    depends_on: list[str] = Field(default_factory=list)
+
+
+class BatchSubmitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    tasks: list[BatchTaskRequest] = Field(min_length=1, max_length=1000)
 
 
 class TaskView(BaseModel):
@@ -111,8 +133,16 @@ def create_app(service: TaskService, executor: Executor | None = None) -> FastAP
     async def _conflict_handler(_request, exc: PayloadConflict):
         return JSONResponse(status_code=409, content=_error_body(exc))
 
+    @app.exception_handler(BatchConflict)
+    async def _batch_conflict_handler(_request, exc: BatchConflict):
+        return JSONResponse(status_code=409, content=_error_body(exc))
+
     @app.exception_handler(TaskNotFound)
     async def _not_found_handler(_request, exc: TaskNotFound):
+        return JSONResponse(status_code=404, content=_error_body(exc))
+
+    @app.exception_handler(BatchNotFound)
+    async def _batch_not_found_handler(_request, exc: BatchNotFound):
         return JSONResponse(status_code=404, content=_error_body(exc))
 
     @app.get("/health")
@@ -140,6 +170,37 @@ def create_app(service: TaskService, executor: Executor | None = None) -> FastAP
     @app.get("/tasks/by-key/{idempotency_key}")
     async def get_task_by_key(idempotency_key: str) -> dict[str, Any]:
         return task_to_view(await service.get_by_key(idempotency_key)).model_dump()
+
+    @app.post("/tasks/batch-submit", status_code=201)
+    async def submit_batch(req: BatchSubmitRequest):
+        """批量提交带依赖的任务。
+
+        201 新建批次；200 同 batch_key 重复提交（任务标识与首次一致）。
+        校验失败（环/非法引用/跨作用域等）返回 422 且 error.code 可区分；
+        同批次键内容不一致返回 409 batch_conflict。
+        """
+        records, created, _batch = await service.submit_batch(
+            batch_key=req.idempotency_key,
+            tasks=[t.model_dump() for t in req.tasks],
+        )
+        body = {
+            "batch_idempotency_key": req.idempotency_key,
+            "already_exists": not created,
+            "tasks": [
+                task_to_view(r, already_exists=not created).model_dump()
+                for r in records
+            ],
+        }
+        return JSONResponse(status_code=201 if created else 200, content=body)
+
+    @app.get("/batches/{batch_key}")
+    async def get_batch(batch_key: str) -> dict[str, Any]:
+        batch, members = await service.get_batch(batch_key)
+        return {
+            "batch_id": batch.id,
+            "idempotency_key": batch.idempotency_key,
+            "tasks": [task_to_view(t).model_dump() for t in members],
+        }
 
     @app.post("/tasks/{task_id}/cancel")
     async def cancel_task(task_id: str) -> dict[str, Any]:

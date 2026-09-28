@@ -5,6 +5,7 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
 
 def utcnow() -> datetime:
@@ -15,15 +16,23 @@ def utcnow() -> datetime:
 class TaskStatus(str, enum.Enum):
     """任务状态机枚举（值即持久化字符串）。"""
 
-    PENDING = "pending"        # 已提交，等待调度（可能在退避等待中）
+    PENDING = "pending"        # 已提交，等待调度（可能在退避等待中，也可能在等依赖）
     RUNNING = "running"        # 已被某个工作协程领取执行
     SUCCEEDED = "succeeded"    # 终态：成功
-    FAILED = "failed"          # 终态：重试耗尽或不可重试失败
+    FAILED = "failed"          # 终态：重试耗尽或不可重试失败（任务真正执行过并失败）
     CANCELLED = "cancelled"    # 终态：被取消
+    SKIPPED = "skipped"        # 终态：依赖未满足（前置 failed/cancelled/skipped），
+                               # 任务从未执行；与 failed 严格区分
 
 
 TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
-    {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+    {TaskStatus.SUCCEEDED, TaskStatus.FAILED,
+     TaskStatus.CANCELLED, TaskStatus.SKIPPED}
+)
+
+# “坏终态”：凡依赖链上出现这类状态，后继任务一律不能再执行。
+UNSATISFIABLE_STATUSES: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.SKIPPED}
 )
 
 
@@ -40,6 +49,13 @@ PRIORITY_RANK: dict[Priority, int] = {
     Priority.NORMAL: 1,
     Priority.LOW: 2,
 }
+
+
+# SKIPPED 终态的 error_code：说明“因什么依赖结果被跳过”，可与 failed 的
+# retryable/fatal/timeout/handler_error 明确区分。
+SKIP_REASON_DEP_FAILED = "dependency_failed"
+SKIP_REASON_DEP_CANCELLED = "dependency_cancelled"
+SKIP_REASON_DEP_SKIPPED = "dependency_skipped"
 
 
 @dataclass
@@ -68,6 +84,35 @@ class TaskRecord:
     cancel_requested: bool = False
 
 
+@dataclass(frozen=True)
+class BatchTaskSpec:
+    """批量提交中的单个任务规格；依赖以业务幂等键声明。
+
+    depends_on 中引用的键可以是同批任务，也可以是此前已经单独/批量提交过的
+    任务；持久层负责在提交时验证引用存在、作用域一致且不形成环。
+    """
+
+    idempotency_key: str
+    task_type: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    priority: Priority = Priority.NORMAL
+    scope: str = "default"
+    max_attempts: int = 3
+    timeout_seconds: float = 10.0
+    depends_on: tuple[str, ...] = ()
+
+
+@dataclass
+class BatchRecord:
+    """一次批量提交的权威记录（batches 表一行）。"""
+
+    id: str
+    idempotency_key: str
+    content_hash: str
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
+
+
 class OrchestratorError(Exception):
     """服务层异常基类。"""
 
@@ -80,5 +125,13 @@ class PayloadConflict(OrchestratorError):
     """幂等键相同但载荷不一致（HTTP 409 语义）。"""
 
 
+class BatchConflict(OrchestratorError):
+    """批次幂等键相同但批次内容/依赖关系不一致（HTTP 409 语义）。"""
+
+
 class TaskNotFound(OrchestratorError):
     """任务不存在（HTTP 404 语义）。"""
+
+
+class BatchNotFound(OrchestratorError):
+    """批次不存在（HTTP 404 语义）。"""
