@@ -19,7 +19,7 @@
 ```bash
 uv sync
 uv run uvicorn main:app --reload          # 启动服务（默认 tasks.db）
-uv run pytest -q                          # 运行全部测试（39 个用例）
+uv run pytest -q                          # 运行全部测试（44 个用例）
 uv run pytest -q --log-cli-level=INFO     # 含输入与判定依据的详细日志
 ```
 
@@ -205,7 +205,12 @@ uv run pytest -q --log-cli-level=INFO     # 含输入与判定依据的详细日
 
 ## 持久化结构
 
-新增两张关系表（对旧版 `tasks.db` 会幂等加列 `batch_id`，无需手工迁移）：
+结构由 `PRAGMA user_version` 标记版本（当前为 2），启动时按版本逐段自动迁移：
+
+- v1：`tasks` 基础表（幂等键唯一、状态机字段）；
+- v2：批量依赖编排——`tasks` 增加 `batch_id` 列，新增下述三张关系表。
+
+批量依赖编排新增的关系表：
 
 - `batches`：批次幂等键唯一、内容指纹 `content_hash`；
 - `batch_members`：批次 → 任务的成员关系与提交顺序 `position`；
@@ -214,6 +219,34 @@ uv run pytest -q --log-cli-level=INFO     # 含输入与判定依据的详细日
 
 级联传播用 SQLite **递归 CTE** 从当前所有坏终态出发沿依赖边求后继闭包，再在
 同一事务内把闭包中的 pending 任务更新为 skipped，天然幂等、可在重启时安全重放。
+
+## 从旧版库升级
+
+- **兼容范围**：上一版（仅 `tasks` 表、无批量依赖表）的 `tasks.db` 可直接用
+  本版程序启动，无需手工迁移。启动时 `TaskStore.connect` 在**单个事务**内完成：
+  给 `tasks` 补 `batch_id` 列、创建 `batches` / `batch_members` /
+  `task_dependencies` 及索引、把 `user_version` 推进到 2。已有任务与状态
+  原样保留，升级后即可正常提交/查询带依赖的批量任务。
+- **幂等与反复重启**：迁移按 `user_version` 逐段执行且每段幂等，同一个库
+  反复启动不会重复迁移，也不会再报结构相关的错。
+- **失败行为**：整个迁移要么全部生效、要么整体回滚，不会留下半新半旧的库。
+  迁移后做结构自检（必需的表与列齐全）；以下情况启动即失败并抛出带原因的
+  `MigrationError`，库文件不被改动：
+  - 库的 `user_version` 高于本程序支持的版本（提示升级程序或更换库文件）；
+  - 库缺少必需的表或列、无法安全补齐（提示具体缺失项）。
+- **本地验证**：
+
+```bash
+# 用上一版程序生成旧库（或直接沿用已有的 tasks.db），然后：
+uv run uvicorn main:app            # 旧库启动：自动升级，日志无结构错误
+# 校验升级结果（期望版本 2，且含三张批量表）：
+uv run python -c "import sqlite3; c=sqlite3.connect('tasks.db'); \
+print('user_version =', c.execute('PRAGMA user_version').fetchone()[0]); \
+print('tables =', sorted(r[0] for r in c.execute(\
+\"SELECT name FROM sqlite_master WHERE type='table'\")))"
+# 自动化覆盖见 tests/test_migration.py：
+uv run pytest tests/test_migration.py -v --log-cli-level=INFO
+```
 
 ## 重试与超时规则
 
@@ -267,14 +300,15 @@ uv run pytest -q --log-cli-level=INFO     # 含输入与判定依据的详细日
 ```
 app/
   models.py    # 状态/优先级枚举（含 SKIPPED）、TaskRecord/BatchTaskSpec/BatchRecord、领域异常
-  store.py     # SQLite 持久层：条件 UPDATE 状态机、幂等插入、批量事务、
+  store.py     # SQLite 持久层：版本化结构迁移（user_version + 单事务 + 自检）、
+               #            条件 UPDATE 状态机、幂等插入、批量事务、
                #            依赖门禁、递归 CTE 级联 skipped、启动恢复
   handlers.py  # 处理器注册表、取消令牌、4 个内置处理器
   executor.py  # 调度循环（仅派发依赖已满足任务）、优先级老化、作用域信号量、重试/超时/取消
   service.py   # 单任务/批量提交校验、规范化内容哈希、幂等/冲突判定、批次查询
   api.py       # FastAPI 路由与错误码映射（含 /tasks/batch-submit、/batches/{key}）
 main.py        # 组装入口：uvicorn main:app
-tests/         # 5 组 39 个用例
+tests/         # 6 组 44 个用例（含 test_migration.py 旧库升级与反复重启）
 ```
 
 ## 本地验证
