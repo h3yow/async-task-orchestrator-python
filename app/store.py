@@ -18,71 +18,92 @@ from .models import (
     BatchTaskSpec,
     PayloadConflict,
     Priority,
+    SchemaMigrationError,
     TaskRecord,
     TaskStatus,
     ValidationFailure,
     utcnow,
 )
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS tasks (
-    id TEXT PRIMARY KEY,
-    idempotency_key TEXT UNIQUE NOT NULL,
-    task_type TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    payload_hash TEXT NOT NULL,
-    priority TEXT NOT NULL,
-    scope TEXT NOT NULL,
-    max_attempts INTEGER NOT NULL,
-    timeout_seconds REAL NOT NULL,
-    status TEXT NOT NULL,
-    attempts INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    scheduled_at TEXT NOT NULL,
-    started_at TEXT,
-    finished_at TEXT,
-    result TEXT,
-    error_code TEXT,
-    error_message TEXT,
-    cancel_requested INTEGER NOT NULL DEFAULT 0,
-    batch_id TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_tasks_dispatch
-    ON tasks (status, scheduled_at);
-CREATE INDEX IF NOT EXISTS idx_tasks_scope ON tasks (scope, status);
-CREATE INDEX IF NOT EXISTS idx_tasks_batch ON tasks (batch_id);
+# 结构版本：1 = 仅单任务（tasks 表，无 batch_id）；2 = 批量依赖编排。
+# 版本号记录在 SQLite 的 user_version 里，升级幂等，重复启动不会重复迁移。
+_SCHEMA_VERSION = 2
 
-CREATE TABLE IF NOT EXISTS batches (
-    id TEXT PRIMARY KEY,
-    idempotency_key TEXT UNIQUE NOT NULL,
-    content_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
+# 建表语句（全新库一步到位，含批量能力）；对旧库均为 IF NOT EXISTS 空操作。
+_SCHEMA_TABLES: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        idempotency_key TEXT UNIQUE NOT NULL,
+        task_type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        priority TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        max_attempts INTEGER NOT NULL,
+        timeout_seconds REAL NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        scheduled_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT,
+        result TEXT,
+        error_code TEXT,
+        error_message TEXT,
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
+        batch_id TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS batches (
+        id TEXT PRIMARY KEY,
+        idempotency_key TEXT UNIQUE NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    # 批次成员（按提交时的位置保存，含复用的已存在任务），用于按批次查询。
+    """
+    CREATE TABLE IF NOT EXISTS batch_members (
+        batch_id TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL,
+        PRIMARY KEY (batch_id, task_id)
+    )
+    """,
+    # 依赖边：task_id 必须等 depends_on_task_id 成功后才允许执行。
+    # 边只在批量提交事务内整体写入，写入前已完成存在性/作用域/环校验。
+    """
+    CREATE TABLE IF NOT EXISTS task_dependencies (
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        PRIMARY KEY (task_id, depends_on_task_id)
+    )
+    """,
+)
 
--- 批次成员（按提交时的位置保存，含复用的已存在任务），用于按批次查询。
-CREATE TABLE IF NOT EXISTS batch_members (
-    batch_id TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
-    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    position INTEGER NOT NULL,
-    PRIMARY KEY (batch_id, task_id)
-);
-CREATE INDEX IF NOT EXISTS idx_batch_members_task
-    ON batch_members (task_id);
+# 索引在建表与补列之后统一创建，保证引用的列一定存在。
+_SCHEMA_INDEXES: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_tasks_dispatch ON tasks (status, scheduled_at)",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_scope ON tasks (scope, status)",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_batch ON tasks (batch_id)",
+    "CREATE INDEX IF NOT EXISTS idx_batch_members_task ON batch_members (task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_deps_downstream "
+    "ON task_dependencies (depends_on_task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_deps_upstream ON task_dependencies (task_id)",
+)
 
--- 依赖边：task_id 必须等 depends_on_task_id 成功后才允许执行。
--- 边只在批量提交事务内整体写入，写入前已完成存在性/作用域/环校验。
-CREATE TABLE IF NOT EXISTS task_dependencies (
-    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    PRIMARY KEY (task_id, depends_on_task_id)
-);
-CREATE INDEX IF NOT EXISTS idx_deps_downstream
-    ON task_dependencies (depends_on_task_id);
-CREATE INDEX IF NOT EXISTS idx_deps_upstream
-    ON task_dependencies (task_id);
-"""
+# v1 版 tasks 表就存在的核心列。旧库的 tasks 表若缺少其中任何一列，
+# 说明它不是本服务（或可兼容版本）创建的库，拒绝升级而不是硬改。
+_TASKS_CORE_COLUMNS: frozenset[str] = frozenset({
+    "id", "idempotency_key", "task_type", "payload", "payload_hash",
+    "priority", "scope", "max_attempts", "timeout_seconds", "status",
+    "attempts", "created_at", "updated_at", "scheduled_at",
+    "cancel_requested",
+})
 
 
 def _dt(value: datetime) -> str:
@@ -101,26 +122,75 @@ class TaskStore:
         self._conn: sqlite3.Connection | None = None
 
     def connect(self) -> None:
-        """打开连接（WAL + 忙等）并建表。"""
+        """打开连接（WAL + 忙等），并把库结构迁移到当前版本。
+
+        迁移失败（旧库不兼容、版本过新等）会抛出 SchemaMigrationError 并
+        关闭连接，此时库内不会产生任何半完成的结构变更。
+        """
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.executescript(_SCHEMA)
-        self._migrate(conn)
+        try:
+            self._migrate(conn)
+        except BaseException:
+            conn.close()
+            raise
         self._conn = conn
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
-        """对旧版库做幂等加列（CREATE TABLE IF NOT EXISTS 不会补列）。"""
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
-        if "batch_id" not in cols:
-            conn.execute("ALTER TABLE tasks ADD COLUMN batch_id TEXT")
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tasks_batch ON tasks (batch_id)"
+        """把库结构幂等升级到 _SCHEMA_VERSION。
+
+        - 先校验后写入：版本过新、或已有 tasks 表缺少核心列（不是本服务
+          可兼容的库）时，在任何写操作之前抛出 SchemaMigrationError；
+        - 建表、补列（ALTER TABLE 增加 batch_id）、建索引、版本号落库
+          在同一个事务内完成，任何一步失败都整体回滚，不会留下半新半旧
+          的结构；
+        - 全部语句幂等，同一库反复启动不会重复迁移也不会报错。
+        """
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > _SCHEMA_VERSION:
+            raise SchemaMigrationError(
+                f"schema_too_new:数据库结构版本 {version} 高于本服务支持的 "
+                f"{_SCHEMA_VERSION}，请升级服务版本后再启动"
             )
-        conn.commit()
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "tasks" in tables:
+            cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(tasks)")
+            }
+            missing = sorted(_TASKS_CORE_COLUMNS - cols)
+            if missing:
+                raise SchemaMigrationError(
+                    f"schema_incompatible:现有 tasks 表缺少核心列 {missing}，"
+                    "无法安全升级；请确认该库由本服务创建，或换用新的库文件"
+                )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for stmt in _SCHEMA_TABLES:
+                conn.execute(stmt)
+            cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(tasks)")
+            }
+            if "batch_id" not in cols:
+                # 旧版（v1）库补列；CREATE TABLE IF NOT EXISTS 不会补列
+                conn.execute("ALTER TABLE tasks ADD COLUMN batch_id TEXT")
+            for stmt in _SCHEMA_INDEXES:
+                conn.execute(stmt)
+            conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         if self._conn is not None:

@@ -135,3 +135,7 @@ class TaskNotFound(OrchestratorError):
 
 class BatchNotFound(OrchestratorError):
     """批次不存在（HTTP 404 语义）。"""
+
+
+class SchemaMigrationError(OrchestratorError):
+    """数据库结构无法安全升级到当前版本（启动即失败，不留下半新半旧的库）。"""

@@ -19,7 +19,7 @@
 ```bash
 uv sync
 uv run uvicorn main:app --reload          # 启动服务（默认 tasks.db）
-uv run pytest -q                          # 运行全部测试（39 个用例）
+uv run pytest -q                          # 运行全部测试（45 个用例）
 uv run pytest -q --log-cli-level=INFO     # 含输入与判定依据的详细日志
 ```
 
@@ -203,10 +203,25 @@ uv run pytest -q --log-cli-level=INFO     # 含输入与判定依据的详细日
 - 语义仍为 at-least-once：崩溃窗口内的处理器可能已产生副作用，业务侧需以幂等键
   与处理器自身幂等保证最终效果唯一。
 
-## 持久化结构
+## 持久化结构与版本升级
 
-新增两张关系表（对旧版 `tasks.db` 会幂等加列 `batch_id`，无需手工迁移）：
+结构版本记录在 SQLite 的 `user_version` 中：**v1** 为仅单任务的初版（只有
+`tasks` 表，无 `batch_id` 列），**v2** 为当前版本（批量依赖编排）。启动时
+`TaskStore.connect` 会把库**幂等**迁移到当前版本，无需手工迁移：
 
+- **v1 → v2 升级**：在同一个事务内完成建表（`batches` / `batch_members` /
+  `task_dependencies`）、`ALTER TABLE tasks ADD COLUMN batch_id`、建索引与
+  版本号落库；已有任务与状态**原样保留**（不清空、不重建、不改写），升级后
+  批量依赖功能立即可用，同一库反复重启不会重复迁移。
+- **兼容范围**：仅支持由本服务 v1 版本创建的库（`tasks` 表含全部核心列）。
+  `tasks` 表缺少核心列的库会在**任何写操作之前**以
+  `SchemaMigrationError(schema_incompatible)` 明确拒绝启动；结构版本比服务
+  还新的库以 `SchemaMigrationError(schema_too_new)` 拒绝。失败即整体回滚，
+  不会留下半新半旧的结构。
+
+当前版本的表结构：
+
+- `tasks`：任务主表（v2 起含 `batch_id` 列，记录创建该任务的批次）；
 - `batches`：批次幂等键唯一、内容指纹 `content_hash`；
 - `batch_members`：批次 → 任务的成员关系与提交顺序 `position`；
 - `task_dependencies`：`(task_id, depends_on_task_id)` 依赖边（外键、联合主键），
@@ -268,13 +283,14 @@ uv run pytest -q --log-cli-level=INFO     # 含输入与判定依据的详细日
 app/
   models.py    # 状态/优先级枚举（含 SKIPPED）、TaskRecord/BatchTaskSpec/BatchRecord、领域异常
   store.py     # SQLite 持久层：条件 UPDATE 状态机、幂等插入、批量事务、
-               #            依赖门禁、递归 CTE 级联 skipped、启动恢复
+               #            依赖门禁、递归 CTE 级联 skipped、启动恢复、
+               #            结构版本迁移（user_version，v1->v2 幂等升级）
   handlers.py  # 处理器注册表、取消令牌、4 个内置处理器
   executor.py  # 调度循环（仅派发依赖已满足任务）、优先级老化、作用域信号量、重试/超时/取消
   service.py   # 单任务/批量提交校验、规范化内容哈希、幂等/冲突判定、批次查询
   api.py       # FastAPI 路由与错误码映射（含 /tasks/batch-submit、/batches/{key}）
 main.py        # 组装入口：uvicorn main:app
-tests/         # 5 组 39 个用例
+tests/         # 6 组 45 个用例
 ```
 
 ## 本地验证
@@ -300,6 +316,21 @@ curl -s -X POST localhost:8000/tasks/batch-submit \
       {"idempotency_key":"export","task_type":"echo","payload":{},"depends_on":["agg"]}
     ]}'
 curl -s localhost:8000/batches/pipeline-1
+
+# 4) 从旧版库（v1 结构）启动的升级验证
+#    a. 直接沿用上一版服务留下的 tasks.db 启动即可，启动日志无报错即升级成功：
+TASK_DB_PATH=/path/to/旧版tasks.db uv run uvicorn main:app --port 8000
+#    b. 确认结构版本已升到 2、旧任务仍在：
+sqlite3 /path/to/旧版tasks.db 'PRAGMA user_version; SELECT COUNT(*) FROM tasks;'
+curl -s localhost:8000/tasks/by-key/<旧任务的业务键>
+#    c. 确认批量依赖功能在升级后的库上可用：
+curl -s -X POST localhost:8000/tasks/batch-submit \
+  -H 'Content-Type: application/json' -d '{
+    "idempotency_key":"post-upgrade-batch",
+    "tasks":[{"idempotency_key":"t1","task_type":"echo","payload":{}}]}'
+#    d. 自动化覆盖：tests/test_migration.py 会现场构造 v1 结构的旧库，
+#       验证升级、数据保留、批量提交/查询与反复重启稳定性：
+uv run pytest tests/test_migration.py -q --log-cli-level=INFO
 ```
 
 测试覆盖的关键场景：
@@ -318,4 +349,9 @@ curl -s localhost:8000/batches/pipeline-1
   多前置部分失败与跳过原因分层、跳过的传递闭包、前置取消传播、**等待依赖期间
   取消立即终态**、依赖释放后作用域并发上限与优先级顺序、等待中老化不被新高任务
   长期插队、**异常重启后已完成前置不重复执行/后继不提前执行/skipped 不丢**，
-  以及 **120 个任务 4 层依赖**的规模场景。
+  以及 **120 个任务 4 层依赖**的规模场景；
+- `tests/test_migration.py`（6 个）：**v1 旧结构库启动升级**（旧任务逐字段保留、
+  可查询）、升级后**带依赖批量提交/门禁/级联/批次查询**立即可用、依赖旧库
+  已失败任务的新任务提交即 `skipped`、**同一库反复重启**结构版本与数据稳定、
+  不兼容库与过新版本库**启动即明确失败且不留半迁移痕迹**、默认启动入口
+  （`main:app` + `TASK_DB_PATH`）覆盖从旧库启动的路径。
